@@ -5,10 +5,12 @@ package dashboard
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"sync"
@@ -49,6 +51,12 @@ type dashboardCommand struct {
 
 	hideCreds bool
 	browser   bool
+	// noController enables bootstrap bridge mode when no controller exists.
+	noController bool
+	// bridgePort is the port for the localhost bridge server in no-controller mode.
+	bridgePort int
+	// bridgeBind is the bind address for the bridge server (default "localhost").
+	bridgeBind string
 
 	newAPIFunc func() (ControllerAPI, bool, error)
 
@@ -112,13 +120,38 @@ func (c *dashboardCommand) Info() *cmd.Info {
 // SetFlags implements the cmd.Command interface.
 func (c *dashboardCommand) SetFlags(f *gnuflag.FlagSet) {
 	c.ModelCommandBase.SetFlags(f)
-	f.IntVar(&c.port, "port", 31666, "Local port used to serve the dashboard")
+	f.IntVar(&c.port, "port", 8036, "Local port used to serve the dashboard")
 	f.BoolVar(&c.hideCreds, "hide-credential", false, "Do not show admin credential to use for logging into the Juju Dashboard")
 	f.BoolVar(&c.browser, "browser", false, "Open the web browser, instead of just printing the Juju Dashboard URL")
+	f.BoolVar(&c.noController, "no-controller", false, "Start a localhost bridge server for bootstrap when no controller exists")
+	f.IntVar(&c.bridgePort, "bridge-port", 17070, "Local port for the bootstrap bridge server (used with --no-controller)")
+	f.StringVar(&c.bridgeBind, "bridge-bind", "localhost", "Bind address for the bridge server (use 0.0.0.0 for multipass/remote access)")
+}
+
+// SetModelIdentifier overrides the base to skip controller checks in no-controller mode.
+// The modelcmd wrapper calls this before Init, so we intercept here.
+func (c *dashboardCommand) SetModelIdentifier(modelIdentifier string, allowDefault bool) error {
+	if c.noController {
+		return nil
+	}
+	return c.ModelCommandBase.SetModelIdentifier(modelIdentifier, allowDefault)
+}
+
+// Init implements the cmd.Command interface.
+func (c *dashboardCommand) Init(args []string) error {
+	if c.noController {
+		return nil
+	}
+	return c.ModelCommandBase.Init(args)
 }
 
 // Run implements the cmd.Command interface.
 func (c *dashboardCommand) Run(ctx *cmd.Context) error {
+	// Check for no-controller mode first.
+	if c.noController {
+		return c.runNoControllerMode(ctx)
+	}
+
 	api, _, err := c.newAPIFunc()
 	if err != nil {
 		return errors.Trace(err)
@@ -209,6 +242,114 @@ func (c *dashboardCommand) Run(ctx *cmd.Context) error {
 			return userErr
 		}
 	}
+}
+
+// runNoControllerMode starts a localhost bridge server for bootstrap when no controller exists.
+func (c *dashboardCommand) runNoControllerMode(ctx *cmd.Context) error {
+	// Generate a short-lived token for bridge authentication.
+	token := generateBridgeToken()
+
+	// Dashboard URL that will be returned after successful bootstrap.
+	// For POC, we use a placeholder that would be resolved after bootstrap.
+	dashboardURL := fmt.Sprintf("http://localhost:%d", c.port)
+
+	// Create the bridge server with a bootstrap function.
+	cfg := BridgeConfig{
+		Bind:         c.bridgeBind,
+		Port:         c.bridgePort,
+		Token:        token,
+		BootstrapURL: dashboardURL,
+		BootstrapFunc: func(bCtx context.Context, req BootstrapRequest) error {
+			return c.runBootstrapFromBridge(bCtx, req)
+		},
+	}
+
+	bs, err := NewBridgeServer(cfg)
+	if err != nil {
+		return errors.Annotate(err, "creating bridge server")
+	}
+
+	bridgeURL := bs.URL()
+	ctx.Infof("Starting bootstrap bridge server at %s", bridgeURL)
+	ctx.Infof("Bridge token: %s", token)
+	ctx.Infof("Bootstrap UI URL: %s/bootstrap", bridgeURL)
+
+	// Open the bootstrap UI in the browser if requested.
+	if c.browser {
+		bootstrapUIURL := fmt.Sprintf("%s/bootstrap?token=%s", bridgeURL, token)
+		if err := c.openBrowser(ctx, "Bootstrap UI", bootstrapUIURL); err != nil {
+			ctx.Infof("Failed to open browser: %v", err)
+		}
+	}
+
+	// Run the bridge server (blocks until interrupted).
+	stdctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- bs.Start(stdctx)
+	}()
+
+	signal.Notify(c.signalCh, os.Interrupt, os.Kill)
+	select {
+	case waitSig := <-c.signalCh:
+		ctx.Infof("Received signal %s, stopping bridge server", waitSig)
+		cancel()
+	case err := <-errCh:
+		if err != nil {
+			return errors.Annotate(err, "bridge server error")
+		}
+	}
+
+	return nil
+}
+
+// runBootstrapFromBridge invokes the bootstrap path from the bridge server.
+//
+// POC NOTE: The bootstrap command lives in cmd/juju/commands which imports
+// this dashboard package, creating an import cycle. For the POC we use
+// exec.Command to invoke the juju binary's bootstrap command directly.
+// In a full implementation, the bootstrap logic should be extracted to a
+// shared internal package.
+func (c *dashboardCommand) runBootstrapFromBridge(ctx context.Context, req BootstrapRequest) error {
+	// Build bootstrap command args from the bridge request.
+	args := []string{"bootstrap"}
+	cloudArg := req.Cloud
+	if req.Region != "" {
+		cloudArg = req.Cloud + "/" + req.Region
+	}
+	args = append(args, cloudArg, req.ControllerName)
+	if req.CredentialName != "" {
+		args = append(args, "--credential", req.CredentialName)
+	}
+
+	// Find the juju binary and execute bootstrap.
+	// Use PATH lookup (snap-installed juju) so the jujud binary version matches.
+	jujuPath, err := exec.LookPath("juju")
+	if err != nil {
+		return errors.Annotate(err, "finding juju binary")
+	}
+
+	cmd := exec.CommandContext(ctx, jujuPath, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	if err := cmd.Run(); err != nil {
+		return errors.Annotate(err, "running bootstrap")
+	}
+
+	return nil
+}
+
+// generateBridgeToken creates a short-lived token for bridge authentication.
+func generateBridgeToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "juju-bridge-poc-token-fallback"
+	}
+	return fmt.Sprintf("juju-bridge-%x", b)
 }
 
 func tunnelSSHRunner(
